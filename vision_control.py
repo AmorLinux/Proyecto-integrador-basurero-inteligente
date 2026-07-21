@@ -16,7 +16,9 @@ INDICE_CAMARA = 0
 NUMERO_MUESTRAS = 5           # Fotogramas analizados por cada objeto detectado
 ESPERA_ESTABILIZACION = 0.20  # Da tiempo a que el objeto deje de moverse
 INTERVALO_MUESTRAS = 0.08
-MOSTRAR_PREVIA = False        # Actívalo solo si el equipo tiene pantalla
+MOSTRAR_PREVIA = True         # False si el bin corre sin pantalla (modo headless)
+VENTANA_DEBUG = "Smart Bin - depuracion en vivo"
+TIEMPO_RESULTADO_MS = 900     # Tiempo para inspeccionar la decisión final en pantalla
 # =================================================
 
 
@@ -63,11 +65,92 @@ def clasificar_fotograma(frame_bgr, session, input_name):
         "frame": frame_bgr,
         "clase": CLASES[indice],
         "confianza": float(probs[indice]),
+        "probabilidades": probs,
     }
 
 
 def normalizar_clase(clase):
     return clase.strip().lower()
+
+
+def dibujar_debug(frame, estado, muestras=None, muestra_actual=None, comando=None):
+    """Dibuja en la vista de cámara cada estado de la decisión del bin."""
+    vista = frame.copy()
+    alto, ancho = vista.shape[:2]
+    color_estado = (0, 200, 0) if comando in (b"G", b"P") else (0, 190, 255)
+
+    # Zona que conviene usar para colocar la botella durante las pruebas.
+    lado = min(alto, ancho)
+    x0, y0 = (ancho - lado) // 2, (alto - lado) // 2
+    cv2.rectangle(vista, (x0, y0), (x0 + lado, y0 + lado), (120, 120, 120), 1)
+
+    # Panel oscuro para que el texto sea visible con cualquier fondo.
+    panel = vista.copy()
+    cv2.rectangle(panel, (0, 0), (ancho, min(alto, 225)), (0, 0, 0), -1)
+    vista = cv2.addWeighted(panel, 0.65, vista, 0.35, 0)
+
+    cv2.putText(vista, estado, (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color_estado, 2)
+    cv2.putText(
+        vista,
+        f"Umbral: {UMBRAL_CONFIANZA:.0%} | q = salir",
+        (18, 61),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (255, 255, 255),
+        1,
+    )
+
+    if muestra_actual is not None:
+        clase = muestra_actual["clase"]
+        confianza = muestra_actual["confianza"]
+        cv2.putText(
+            vista,
+            f"Muestra actual: {clase} ({confianza:.1%})",
+            (18, 91),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.68,
+            (255, 255, 255),
+            2,
+        )
+        for indice, clase in enumerate(CLASES):
+            probabilidad = float(muestra_actual["probabilidades"][indice])
+            y = 108 + indice * 27
+            ancho_barra = int(probabilidad * 210)
+            cv2.putText(
+                vista,
+                f"{clase:<7} {probabilidad:.1%}",
+                (18, y + 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+            )
+            cv2.rectangle(vista, (155, y), (155 + ancho_barra, y + 16), (200, 200, 0), -1)
+
+    if muestras:
+        resumen = " | ".join(
+            f"{indice + 1}:{muestra['clase']} {muestra['confianza']:.0%}"
+            for indice, muestra in enumerate(muestras)
+        )
+        cv2.putText(
+            vista,
+            f"Muestras: {resumen}",
+            (18, min(alto - 18, 213)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+        )
+    return vista
+
+
+def mostrar_debug(frame, estado, muestras=None, muestra_actual=None, comando=None, espera_ms=1):
+    """Muestra la interfaz y devuelve True cuando el usuario pide salir con q."""
+    if not MOSTRAR_PREVIA:
+        return False
+    vista = dibujar_debug(frame, estado, muestras, muestra_actual, comando)
+    cv2.imshow(VENTANA_DEBUG, vista)
+    return cv2.waitKey(max(1, espera_ms)) & 0xFF == ord("q")
 
 
 def decidir_muestras(muestras):
@@ -145,10 +228,8 @@ try:
             time.sleep(0.1)
             continue
 
-        if MOSTRAR_PREVIA:
-            cv2.imshow("Vista previa - presiona q para salir", previa)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+        if mostrar_debug(previa, "1/4 Esperando DETECTADO del sensor..."):
+            break
 
         if arduino.in_waiting <= 0:
             continue
@@ -159,30 +240,58 @@ try:
             continue
 
         print("\n🤖 [HARDWARE] Objeto detectado. Esperando estabilidad...")
-        time.sleep(ESPERA_ESTABILIZACION)
+        if MOSTRAR_PREVIA:
+            if mostrar_debug(
+                previa,
+                "2/4 Objeto detectado: estabilizando...",
+                espera_ms=int(ESPERA_ESTABILIZACION * 1000),
+            ):
+                break
+        else:
+            time.sleep(ESPERA_ESTABILIZACION)
 
         muestras = []
+        salir_durante_muestras = False
         for numero in range(NUMERO_MUESTRAS):
             ret, frame = cap.read()
+            muestra_actual = None
             if not ret:
                 print(f"⚠️ No se pudo capturar la muestra {numero + 1}.")
+                frame = previa
             else:
                 try:
-                    muestra = clasificar_fotograma(frame, session, IN_NAME)
-                    muestras.append(muestra)
+                    muestra_actual = clasificar_fotograma(frame, session, IN_NAME)
+                    muestras.append(muestra_actual)
                     print(
                         f"  Muestra {numero + 1}/{NUMERO_MUESTRAS}: "
-                        f"{muestra['clase']} ({muestra['confianza']:.1%})"
+                        f"{muestra_actual['clase']} ({muestra_actual['confianza']:.1%})"
                     )
                 except Exception as e:
                     print(f"⚠️ Error procesando la muestra {numero + 1}: {e}")
 
-            if numero < NUMERO_MUESTRAS - 1:
+            estado = f"3/4 Analizando muestra {numero + 1}/{NUMERO_MUESTRAS}"
+            if MOSTRAR_PREVIA:
+                if mostrar_debug(
+                    frame,
+                    estado,
+                    muestras,
+                    muestra_actual,
+                    espera_ms=int(INTERVALO_MUESTRAS * 1000),
+                ):
+                    salir_durante_muestras = True
+                    break
+            elif numero < NUMERO_MUESTRAS - 1:
                 time.sleep(INTERVALO_MUESTRAS)
+
+        if salir_durante_muestras:
+            break
 
         mejor_muestra, comando = decidir_muestras(muestras)
         if mejor_muestra is None:
-            print("❓ Descarte: ninguna muestra válida superó el umbral o fue vidrio/plástico.")
+            print("❓ Descarte: ninguna muestra fue una clasificación válida de vidrio/plástico.")
+            estado_final = "4/4 Resultado: RECHAZADO -> comando O"
+            frame_final = muestras[-1]["frame"] if muestras else previa
+            muestra_final = muestras[-1] if muestras else None
         else:
             cv2.imwrite("ultima_foto.jpg", mejor_muestra["frame"])
             etiqueta = "VIDRIO" if comando == b"G" else "PLÁSTICO"
@@ -191,9 +300,21 @@ try:
                 f"(mejor muestra: {mejor_muestra['confianza']:.1%}) -> "
                 f"Enviando '{comando.decode()}'"
             )
+            estado_final = f"4/4 Resultado: {etiqueta} -> comando {comando.decode()}"
+            frame_final = mejor_muestra["frame"]
+            muestra_final = mejor_muestra
 
         arduino.write(comando)
         arduino.flush()
+        if MOSTRAR_PREVIA and mostrar_debug(
+            frame_final,
+            estado_final,
+            muestras,
+            muestra_final,
+            comando,
+            espera_ms=TIEMPO_RESULTADO_MS,
+        ):
+            break
         print("\nEsperando que el sensor ultrasónico detecte una botella...\n")
 finally:
     cap.release()
