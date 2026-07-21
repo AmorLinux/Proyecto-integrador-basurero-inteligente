@@ -12,9 +12,13 @@ BAUDIOS = 9600
 RUTA_MODELO = 'bottle_classifier.onnx'
 CONFIG_PATH = 'model_config.json'
 
-INDICE_CAMARA = 0
+INDICE_CAMARA = 2
 NUMERO_MUESTRAS = 5           # Fotogramas analizados por cada objeto detectado
-ESPERA_ESTABILIZACION = 0.20  # Da tiempo a que el objeto deje de moverse
+# Tiempo que espera DESPUÉS del DETECTADO del sensor antes de clasificar, para dar
+# tiempo a que la botella termine de caer/asentarse en su sitio. El sensor dispara
+# apenas ve algo, así que sin esta espera clasificaría con el objeto aún en el aire.
+# Súbelo si la botella tarda más en quedar bien colocada.
+ESPERA_ESTABILIZACION = 2
 INTERVALO_MUESTRAS = 0.08
 MOSTRAR_PREVIA = True         # False si el bin corre sin pantalla (modo headless)
 VENTANA_DEBUG = "Smart Bin - depuracion en vivo"
@@ -276,16 +280,21 @@ try:
                 break
             continue
 
-        print("\n🤖 [HARDWARE] Objeto detectado. Esperando estabilidad...")
+        print(
+            f"\n🤖 [HARDWARE] Objeto detectado. Esperando "
+            f"{ESPERA_ESTABILIZACION:.1f}s a que se coloque..."
+        )
 
-        # Estabilización SIN congelar: seguimos leyendo y mostrando frames en vivo.
+        # Espera de asentamiento SIN congelar: seguimos leyendo y mostrando frames
+        # en vivo, con una cuenta regresiva para ver cuánto falta para clasificar.
         salir = False
         t_fin = time.time() + ESPERA_ESTABILIZACION
         while time.time() < t_fin:
             frame, muestra_live = leer_y_clasificar(cap, session, IN_NAME)
             if frame is None:
                 continue
-            if mostrar_debug(frame, "Objeto detectado: estabilizando...",
+            restante = max(0.0, t_fin - time.time())
+            if mostrar_debug(frame, f"Coloca el objeto... clasifico en {restante:.1f}s",
                              muestra_actual=muestra_live):
                 salir = True
                 break
@@ -351,6 +360,9 @@ try:
         if salir:
             break
 
+        # Descartamos los DETECTADO que el sensor haya encolado durante todo el
+        # ciclo, para no re-disparar de inmediato con lecturas viejas.
+        arduino.reset_input_buffer()
         print("\nEsperando que el sensor ultrasónico detecte una botella...\n")
 finally:
     cap.release()
