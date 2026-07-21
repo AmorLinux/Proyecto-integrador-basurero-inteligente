@@ -69,6 +69,24 @@ def clasificar_fotograma(frame_bgr, session, input_name):
     }
 
 
+def leer_y_clasificar(cap, session, input_name):
+    """Lee un fotograma y lo clasifica. Devuelve (frame, muestra) o (None, None)."""
+    ret, frame = cap.read()
+    if not ret:
+        return None, None
+    try:
+        muestra = clasificar_fotograma(frame, session, input_name)
+    except Exception as e:
+        print(f"⚠️ Error clasificando fotograma: {e}")
+        muestra = {
+            "frame": frame,
+            "clase": "?",
+            "confianza": 0.0,
+            "probabilidades": np.zeros(len(CLASES), dtype=np.float32),
+        }
+    return frame, muestra
+
+
 def normalizar_clase(clase):
     return clase.strip().lower()
 
@@ -144,13 +162,28 @@ def dibujar_debug(frame, estado, muestras=None, muestra_actual=None, comando=Non
     return vista
 
 
+_previa_deshabilitada = False
+
+
 def mostrar_debug(frame, estado, muestras=None, muestra_actual=None, comando=None, espera_ms=1):
     """Muestra la interfaz y devuelve True cuando el usuario pide salir con q."""
-    if not MOSTRAR_PREVIA:
+    global _previa_deshabilitada
+    if not MOSTRAR_PREVIA or _previa_deshabilitada:
         return False
-    vista = dibujar_debug(frame, estado, muestras, muestra_actual, comando)
-    cv2.imshow(VENTANA_DEBUG, vista)
-    return cv2.waitKey(max(1, espera_ms)) & 0xFF == ord("q")
+    try:
+        vista = dibujar_debug(frame, estado, muestras, muestra_actual, comando)
+        cv2.imshow(VENTANA_DEBUG, vista)
+        return cv2.waitKey(max(1, espera_ms)) & 0xFF == ord("q")
+    except cv2.error as e:
+        # Sin esto la ventana falla en silencio (p. ej. opencv-python-headless
+        # o sin servidor X) y sólo se ven los logs del terminal.
+        print(
+            f"⚠️ No se pudo mostrar la ventana '{VENTANA_DEBUG}': {e}\n"
+            "   Revisa que tengas pantalla/servidor X y 'opencv-python' "
+            "(no '-headless'). Sigo en modo sólo-terminal."
+        )
+        _previa_deshabilitada = True
+        return False
 
 
 def decidir_muestras(muestras):
@@ -219,78 +252,77 @@ print("\n🚀 --- SISTEMA DE CLASIFICACIÓN ACTIVO --- 🚀")
 print("Esperando que el sensor ultrasónico detecte una botella...\n")
 
 # ----------------- 5. BUCLE PRINCIPAL -----------------
+# La cámara se lee y clasifica en CADA vuelta del bucle (igual que test_camara.py),
+# así la ventana siempre muestra vídeo en vivo y nunca se congela mientras esperamos
+# al sensor. El sensor sólo dispara la ráfaga de muestras y el comando al Arduino.
 try:
     while True:
-        # Mantener la cámara leyendo evita abrirla, enfocarla y cerrarla por cada objeto.
-        ret, previa = cap.read()
-        if not ret:
+        frame, muestra_live = leer_y_clasificar(cap, session, IN_NAME)
+        if frame is None:
             print("⚠️ No se pudo leer la cámara.")
             time.sleep(0.1)
             continue
 
-        if mostrar_debug(previa, "1/4 Esperando DETECTADO del sensor..."):
-            break
+        # ¿El sensor reportó un objeto? Usamos 'in' para tolerar saltos de línea.
+        detectado = False
+        if arduino.in_waiting > 0:
+            mensaje_arduino = arduino.readline().decode("utf-8", errors="replace").strip()
+            detectado = "DETECTADO" in mensaje_arduino
 
-        if arduino.in_waiting <= 0:
-            continue
-
-        # Usamos 'in' para tolerar los saltos de línea del Arduino.
-        mensaje_arduino = arduino.readline().decode("utf-8", errors="replace").strip()
-        if "DETECTADO" not in mensaje_arduino:
+        if not detectado:
+            # Vista en vivo continua mientras esperamos al sensor.
+            if mostrar_debug(frame, "En vivo | Esperando DETECTADO del sensor...",
+                             muestra_actual=muestra_live):
+                break
             continue
 
         print("\n🤖 [HARDWARE] Objeto detectado. Esperando estabilidad...")
-        if MOSTRAR_PREVIA:
-            if mostrar_debug(
-                previa,
-                "2/4 Objeto detectado: estabilizando...",
-                espera_ms=int(ESPERA_ESTABILIZACION * 1000),
-            ):
+
+        # Estabilización SIN congelar: seguimos leyendo y mostrando frames en vivo.
+        salir = False
+        t_fin = time.time() + ESPERA_ESTABILIZACION
+        while time.time() < t_fin:
+            frame, muestra_live = leer_y_clasificar(cap, session, IN_NAME)
+            if frame is None:
+                continue
+            if mostrar_debug(frame, "Objeto detectado: estabilizando...",
+                             muestra_actual=muestra_live):
+                salir = True
                 break
-        else:
-            time.sleep(ESPERA_ESTABILIZACION)
+        if salir:
+            break
 
+        # Ráfaga de muestras para votar la clase.
         muestras = []
-        salir_durante_muestras = False
         for numero in range(NUMERO_MUESTRAS):
-            ret, frame = cap.read()
-            muestra_actual = None
-            if not ret:
+            frame, muestra_actual = leer_y_clasificar(cap, session, IN_NAME)
+            if frame is None:
                 print(f"⚠️ No se pudo capturar la muestra {numero + 1}.")
-                frame = previa
-            else:
-                try:
-                    muestra_actual = clasificar_fotograma(frame, session, IN_NAME)
-                    muestras.append(muestra_actual)
-                    print(
-                        f"  Muestra {numero + 1}/{NUMERO_MUESTRAS}: "
-                        f"{muestra_actual['clase']} ({muestra_actual['confianza']:.1%})"
-                    )
-                except Exception as e:
-                    print(f"⚠️ Error procesando la muestra {numero + 1}: {e}")
+                continue
+            if muestra_actual["clase"] != "?":
+                muestras.append(muestra_actual)
+                print(
+                    f"  Muestra {numero + 1}/{NUMERO_MUESTRAS}: "
+                    f"{muestra_actual['clase']} ({muestra_actual['confianza']:.1%})"
+                )
 
-            estado = f"3/4 Analizando muestra {numero + 1}/{NUMERO_MUESTRAS}"
-            if MOSTRAR_PREVIA:
-                if mostrar_debug(
-                    frame,
-                    estado,
-                    muestras,
-                    muestra_actual,
-                    espera_ms=int(INTERVALO_MUESTRAS * 1000),
-                ):
-                    salir_durante_muestras = True
-                    break
-            elif numero < NUMERO_MUESTRAS - 1:
-                time.sleep(INTERVALO_MUESTRAS)
-
-        if salir_durante_muestras:
+            estado = f"Analizando muestra {numero + 1}/{NUMERO_MUESTRAS}"
+            if mostrar_debug(
+                frame,
+                estado,
+                muestras,
+                muestra_actual,
+                espera_ms=int(INTERVALO_MUESTRAS * 1000),
+            ):
+                salir = True
+                break
+        if salir:
             break
 
         mejor_muestra, comando = decidir_muestras(muestras)
         if mejor_muestra is None:
             print("❓ Descarte: ninguna muestra fue una clasificación válida de vidrio/plástico.")
-            estado_final = "4/4 Resultado: RECHAZADO -> comando O"
-            frame_final = muestras[-1]["frame"] if muestras else previa
+            estado_final = "Resultado: RECHAZADO -> comando O"
             muestra_final = muestras[-1] if muestras else None
         else:
             cv2.imwrite("ultima_foto.jpg", mejor_muestra["frame"])
@@ -300,24 +332,27 @@ try:
                 f"(mejor muestra: {mejor_muestra['confianza']:.1%}) -> "
                 f"Enviando '{comando.decode()}'"
             )
-            estado_final = f"4/4 Resultado: {etiqueta} -> comando {comando.decode()}"
-            frame_final = mejor_muestra["frame"]
+            estado_final = f"Resultado: {etiqueta} -> comando {comando.decode()}"
             muestra_final = mejor_muestra
 
         arduino.write(comando)
         arduino.flush()
-        if MOSTRAR_PREVIA and mostrar_debug(
-            frame_final,
-            estado_final,
-            muestras,
-            muestra_final,
-            comando,
-            espera_ms=TIEMPO_RESULTADO_MS,
-        ):
+
+        # Mostrar el resultado SIN congelar: seguimos leyendo frames en vivo mientras
+        # se rotula la decisión final durante TIEMPO_RESULTADO_MS.
+        t_fin = time.time() + TIEMPO_RESULTADO_MS / 1000
+        while time.time() < t_fin:
+            frame_live, _ = leer_y_clasificar(cap, session, IN_NAME)
+            if frame_live is None:
+                continue
+            if mostrar_debug(frame_live, estado_final, muestras, muestra_final, comando):
+                salir = True
+                break
+        if salir:
             break
+
         print("\nEsperando que el sensor ultrasónico detecte una botella...\n")
 finally:
     cap.release()
-    if MOSTRAR_PREVIA:
-        cv2.destroyAllWindows()
+    cv2.destroyAllWindows()
     arduino.close()
