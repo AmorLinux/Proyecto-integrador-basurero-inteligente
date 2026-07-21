@@ -6,6 +6,8 @@ import numpy as np
 import onnxruntime as ort
 import serial
 
+from voz import Locutor
+
 # ================= CONFIGURACIÓN =================
 PUERTO = '/dev/ttyUSB0'  # Ajusta si es necesario
 BAUDIOS = 9600
@@ -23,6 +25,11 @@ INTERVALO_MUESTRAS = 0.08
 MOSTRAR_PREVIA = True         # False si el bin corre sin pantalla (modo headless)
 VENTANA_DEBUG = "Smart Bin - depuracion en vivo"
 TIEMPO_RESULTADO_MS = 900     # Tiempo para inspeccionar la decisión final en pantalla
+
+# --- Voz cuando el objeto NO es vidrio ni plástico (comando O / RECHAZADO) ---
+VOZ_ACTIVA = True
+MENSAJE_RECHAZO = "Objeto no reconocido. No es vidrio ni plástico. Por favor, retíralo."
+COOLDOWN_VOZ = 8.0            # Segundos mínimos entre un aviso de voz y el siguiente
 # =================================================
 
 
@@ -95,7 +102,7 @@ def normalizar_clase(clase):
     return clase.strip().lower()
 
 
-def dibujar_debug(frame, estado, muestras=None, muestra_actual=None, comando=None):
+def dibujar_debug(frame, estado, muestras=None, muestra_actual=None, comando=None, aviso=None):
     """Dibuja en la vista de cámara cada estado de la decisión del bin."""
     vista = frame.copy()
     alto, ancho = vista.shape[:2]
@@ -163,6 +170,16 @@ def dibujar_debug(frame, estado, muestras=None, muestra_actual=None, comando=Non
             (255, 255, 255),
             1,
         )
+
+    # Banner inferior de aviso (p. ej. audio caído). El bin sigue operando;
+    # esto es sólo informativo para depurar sin mirar el terminal.
+    if aviso:
+        y1 = max(0, alto - 30)
+        sub = vista[y1:alto]
+        rojo = np.full_like(sub, (0, 0, 150))
+        vista[y1:alto] = cv2.addWeighted(rojo, 0.55, sub, 0.45, 0)
+        cv2.putText(vista, f"! {aviso}", (18, alto - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     return vista
 
 
@@ -174,8 +191,10 @@ def mostrar_debug(frame, estado, muestras=None, muestra_actual=None, comando=Non
     global _previa_deshabilitada
     if not MOSTRAR_PREVIA or _previa_deshabilitada:
         return False
+    # Si la voz falló o no hay motor, el Locutor lo expone aquí para pintarlo.
+    aviso = getattr(locutor, "mensaje_ui", None) if "locutor" in globals() and locutor else None
     try:
-        vista = dibujar_debug(frame, estado, muestras, muestra_actual, comando)
+        vista = dibujar_debug(frame, estado, muestras, muestra_actual, comando, aviso)
         cv2.imshow(VENTANA_DEBUG, vista)
         return cv2.waitKey(max(1, espera_ms)) & 0xFF == ord("q")
     except cv2.error as e:
@@ -243,6 +262,10 @@ except Exception as e:
     print(f"❌ Error al cargar modelo: {e}")
     arduino.close()
     exit()
+
+# ----------------- 3b. INICIAR VOZ -----------------
+# Si la voz no puede iniciarse no pasa nada: el Locutor degrada a sólo texto.
+locutor = Locutor(cooldown=COOLDOWN_VOZ) if VOZ_ACTIVA else None
 
 # ----------------- 4. INICIAR CÁMARA CONTINUA -----------------
 cap = cv2.VideoCapture(INDICE_CAMARA)
@@ -333,6 +356,9 @@ try:
             print("❓ Descarte: ninguna muestra fue una clasificación válida de vidrio/plástico.")
             estado_final = "Resultado: RECHAZADO -> comando O"
             muestra_final = muestras[-1] if muestras else None
+            # Aviso por voz (en un hilo aparte; el cooldown evita repetir muy seguido).
+            if locutor is not None:
+                locutor.decir(MENSAJE_RECHAZO)
         else:
             cv2.imwrite("ultima_foto.jpg", mejor_muestra["frame"])
             etiqueta = "VIDRIO" if comando == b"G" else "PLÁSTICO"
