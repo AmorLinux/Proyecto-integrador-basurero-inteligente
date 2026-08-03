@@ -1,4 +1,5 @@
 import json
+import os
 import time
 
 import cv2
@@ -9,12 +10,15 @@ import serial
 from voz import Locutor
 
 # ================= CONFIGURACIÓN =================
-PUERTO = '/dev/ttyUSB0'  # Ajusta si es necesario
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Ajustables por variable de entorno para no romper la config de otros equipos/SO
+# (Windows suele usar 'COM3', 'COM5', etc.; Linux usa '/dev/ttyUSB0', '/dev/ttyACM0', etc.)
+PUERTO = os.environ.get('BASURERO_PUERTO', 'COM5')
 BAUDIOS = 9600
-RUTA_MODELO = 'bottle_classifier.onnx'
-CONFIG_PATH = 'model_config.json'
+RUTA_MODELO = os.path.join(BASE_DIR, 'bottle_classifier.onnx')
+CONFIG_PATH = os.path.join(BASE_DIR, 'model_config.json')
 
-INDICE_CAMARA = 2
+INDICE_CAMARA = int(os.environ.get('BASURERO_CAMARA', '1'))
 NUMERO_MUESTRAS = 5           # Fotogramas analizados por cada objeto detectado
 # Tiempo que espera DESPUÉS del DETECTADO del sensor antes de clasificar, para dar
 # tiempo a que la botella termine de caer/asentarse en su sitio. El sensor dispara
