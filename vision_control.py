@@ -1,4 +1,6 @@
 import json
+import queue
+import threading
 import time
 
 import cv2
@@ -7,6 +9,7 @@ import onnxruntime as ort
 import serial
 
 from voz import Locutor
+from ecosort import EcoSortClient, EcoSortError
 
 # ================= CONFIGURACIÓN =================
 PUERTO = '/dev/ttyUSB0'  # Ajusta si es necesario
@@ -24,6 +27,8 @@ ESPERA_ESTABILIZACION = 2
 INTERVALO_MUESTRAS = 0.08
 MOSTRAR_PREVIA = True         # False si el bin corre sin pantalla (modo headless)
 VENTANA_DEBUG = "Smart Bin - depuracion en vivo"
+TIEMPO_MAXIMO_CONFIRMACION_MOVIMIENTO = 8.0
+MENSAJE_FIN_MOVIMIENTO = "Listo para la siguiente botella..."
 TIEMPO_RESULTADO_MS = 900     # Tiempo para inspeccionar la decisión final en pantalla
 
 # --- Voz cuando el objeto NO es vidrio ni plástico (comando O / RECHAZADO) ---
@@ -242,6 +247,162 @@ def decidir_muestras(muestras):
     return mejor_muestra, comandos[clase_ganadora]
 
 
+def esperar_fin_movimiento(cap, estado_final, muestras, muestra_final, comando):
+    """Espera el mensaje final existente del Arduino sin congelar cámara ni UI."""
+    limite = time.time() + TIEMPO_MAXIMO_CONFIRMACION_MOVIMIENTO
+    while time.time() < limite:
+        frame_live, _ = leer_y_clasificar(cap, session, IN_NAME)
+        if frame_live is not None:
+            restante = max(0.0, limite - time.time())
+            estado = f"Mecanismo en movimiento... esperando confirmacion ({restante:.1f}s)"
+            if mostrar_debug(frame_live, estado, muestras, muestra_final, comando):
+                return False, True
+        if arduino.in_waiting > 0:
+            mensaje = arduino.readline().decode("utf-8", errors="replace").strip()
+            if mensaje == MENSAJE_FIN_MOVIMIENTO:
+                return True, False
+    print("No llego la confirmacion final del Arduino; EcoSort se omite.")
+    return False, False
+
+
+def solicitar_qr_en_segundo_plano(material, confianza, resultados):
+    """Un solo POST; cualquier fallo vuelve al bucle principal como resultado."""
+    try:
+        respuesta = ecosort.solicitar_reciclaje(material, confianza)
+        if respuesta is None:
+            resultados.put(("disabled", None, None))
+            return
+        resultados.put(("ok", respuesta, ecosort.crear_imagen_qr(respuesta["claim_url"])))
+    except EcoSortError as error:
+        resultados.put(("error", None, str(error)))
+    except Exception:
+        resultados.put(("error", None, "Error inesperado de EcoSort; QR omitido."))
+
+
+def mostrar_error_ecosort(cap, mensaje, muestras, muestra_final, comando):
+    """Hace visible el fallo brevemente sin detener la captura ni la interfaz."""
+    limite = time.time() + 2.0
+    while time.time() < limite:
+        if descartar_deteccion_durante_qr():
+            return esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando)
+        frame_live = leer_frame_sin_clasificar(cap)
+        if frame_live is not None and mostrar_debug(
+            frame_live, f"EcoSort: {mensaje}", muestras, muestra_final, comando
+        ):
+            return True
+    return False
+
+
+def leer_frame_sin_clasificar(cap):
+    """Conserva la vista de cámara durante QR sin ejecutar inferencia ONNX."""
+    ret, frame = cap.read()
+    return frame if ret else None
+
+
+def descartar_deteccion_durante_qr():
+    """Libera una detección nueva sin clasificarla ni crear otro QR."""
+    while arduino.in_waiting > 0:
+        mensaje = arduino.readline().decode("utf-8", errors="replace").strip()
+        if mensaje == "DETECTADO":
+            arduino.write(b"O")
+            arduino.flush()
+            print("DETECTADO durante QR: enviado O una sola vez; no se genera otro QR.")
+            return True
+    return False
+
+
+def esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando):
+    """Mantiene cámara/UI activas hasta el final normal del descarte O."""
+    while True:
+        frame_live = leer_frame_sin_clasificar(cap)
+        if frame_live is not None and mostrar_debug(
+            frame_live, "Retira el objeto para continuar",
+            muestras,
+            muestra_final,
+            comando,
+        ):
+            return True
+        while arduino.in_waiting > 0:
+            mensaje = arduino.readline().decode("utf-8", errors="replace").strip()
+            if mensaje == MENSAJE_FIN_MOVIMIENTO:
+                print("Descarte durante QR finalizado; Arduino listo nuevamente.")
+                return False
+
+
+def mostrar_qr_o_esperar_error(cap, material, confianza, estado_final, muestras, muestra_final, comando):
+    """Pausa detecciones mientras prepara y muestra el QR en la ventana actual."""
+    resultados = queue.Queue(maxsize=1)
+    threading.Thread(
+        target=solicitar_qr_en_segundo_plano,
+        args=(material, confianza, resultados),
+        daemon=True,
+    ).start()
+
+    while True:
+        frame_live = leer_frame_sin_clasificar(cap)
+        if descartar_deteccion_durante_qr():
+            if esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando):
+                return True
+            # Conservamos la solicitud original; cuando llegue podrá mostrarse
+            # sin crear un segundo POST ni un segundo QR.
+            continue
+        if frame_live is not None and mostrar_debug(
+            frame_live, "Preparando QR de EcoSort. Espera antes de colocar otro residuo.",
+            muestras, muestra_final, comando
+        ):
+            return True
+        try:
+            estado, respuesta, dato = resultados.get_nowait()
+        except queue.Empty:
+            continue
+        if estado == "disabled":
+            return False
+        if estado == "error":
+            print(f"EcoSort: {dato}")
+            return mostrar_error_ecosort(cap, dato, muestras, muestra_final, comando)
+        qr = dato
+        break
+
+    segundos = ecosort.segundos_visibles(respuesta["expires_at"])
+    if segundos <= 0:
+        print("El QR de EcoSort ya expiro; no se mostrara.")
+        return False
+
+    fin_qr = time.time() + segundos
+    while time.time() < fin_qr:
+        frame_live = leer_frame_sin_clasificar(cap)
+        if descartar_deteccion_durante_qr():
+            if esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando):
+                return True
+            # qr, respuesta y fin_qr siguen siendo los originales; el while
+            # muestra el mismo QR sólo durante el tiempo que aún queda.
+            continue
+        if frame_live is None:
+            continue
+        vista = dibujar_debug(
+            frame_live, "QR activo. Espera antes de colocar otro residuo", muestras,
+            muestra_final, comando
+        )
+        alto, ancho = vista.shape[:2]
+        lado = min(alto - 20, ancho // 2)
+        if lado > 0:
+            qr_redimensionado = cv2.resize(qr, (lado, lado), interpolation=cv2.INTER_NEAREST)
+            vista[10:10 + lado, ancho - lado - 10:ancho - 10] = cv2.cvtColor(
+                qr_redimensionado, cv2.COLOR_RGB2BGR
+            )
+        if MOSTRAR_PREVIA and not _previa_deshabilitada:
+            try:
+                cv2.imshow(VENTANA_DEBUG, vista)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    return True
+            except cv2.error:
+                pass
+    if descartar_deteccion_durante_qr():
+        if esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando):
+            return True
+    return False
+
+
 # ----------------- 2. INICIAR HARDWARE -----------------
 try:
     print(f"🔌 Conectando al Nano en {PUERTO}...")
@@ -266,6 +427,7 @@ except Exception as e:
 # ----------------- 3b. INICIAR VOZ -----------------
 # Si la voz no puede iniciarse no pasa nada: el Locutor degrada a sólo texto.
 locutor = Locutor(cooldown=COOLDOWN_VOZ) if VOZ_ACTIVA else None
+ecosort = EcoSortClient()
 
 # ----------------- 4. INICIAR CÁMARA CONTINUA -----------------
 cap = cv2.VideoCapture(INDICE_CAMARA)
@@ -386,8 +548,24 @@ try:
         if salir:
             break
 
-        # Descartamos los DETECTADO que el sensor haya encolado durante todo el
-        # ciclo, para no re-disparar de inmediato con lecturas viejas.
+        # Sólo G/P pueden llegar a EcoSort y siempre después de la confirmación
+        # física final. O/rechazos conservan el flujo original sin QR.
+        if mejor_muestra is not None:
+            confirmado, salir = esperar_fin_movimiento(
+                cap, estado_final, muestras, muestra_final, comando
+            )
+            if salir:
+                break
+            if confirmado:
+                material = "glass" if comando == b"G" else "plastic"
+                if mostrar_qr_o_esperar_error(
+                    cap, material, mejor_muestra["confianza"], estado_final,
+                    muestras, muestra_final, comando,
+                ):
+                    break
+
+        # Durante la espera/QR se ignoran DETECTADO. Al final se limpian los
+        # mensajes acumulados antes de volver a esperar normalmente.
         arduino.reset_input_buffer()
         print("\nEsperando que el sensor ultrasónico detecte una botella...\n")
 finally:

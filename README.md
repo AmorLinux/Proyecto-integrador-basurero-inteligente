@@ -36,7 +36,7 @@ Cuando el objeto **no** es vidrio ni plástico, la laptop lo **avisa por voz**.
 ### 1. Dependencias de Python
 
 ```bash
-pip install onnxruntime opencv-python numpy pyserial
+pip install onnxruntime opencv-python numpy pyserial "qrcode[pil]"
 ```
 
 > Usa `opencv-python`, **no** `opencv-python-headless`: la versión headless no
@@ -83,6 +83,27 @@ Ajusta las constantes al inicio de `vision_control.py`:
 | `COOLDOWN_VOZ` | `8.0` | Segundos mínimos entre un aviso de voz y el siguiente. |
 
 El umbral de confianza y las clases se leen de `model_config.json`.
+
+---
+
+### EcoSort (QR opcional)
+
+La integración se habilita con variables de entorno; la URL debe ser pública y
+HTTPS (por ejemplo, una URL HTTPS temporal de ngrok), nunca `localhost`.
+
+```bash
+export ECOSORT_API_BASE_URL=https://URL-PUBLICA-DE-ECOSORT
+export ECOSORT_DEVICE_API_KEY=clave-secreta-del-dispositivo
+export ECOSORT_QR_ENABLED=true
+export ECOSORT_QR_DISPLAY_SECONDS=120
+```
+
+Tras una clasificación válida y la confirmación final del Arduino, la laptop
+hace un único POST a EcoSort y muestra en la misma ventana un QR creado sólo
+desde `claim_url`. Durante el QR se pausan detecciones nuevas. No se generan
+QR para rechazos ni se reintenta un POST cuyo resultado sea incierto. Si falta
+la configuración, EcoSort rechaza la solicitud o falla la red, el bin continúa
+operando y omite el QR. No guardes claves ni tokens en el repositorio.
 
 ---
 
