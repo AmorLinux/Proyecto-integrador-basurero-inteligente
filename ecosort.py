@@ -3,10 +3,16 @@
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import numpy as np
+from dotenv import load_dotenv
+
+
+# Carga la configuración local sin sobrescribir variables definidas por el sistema.
+load_dotenv(Path(__file__).with_name(".env"))
 
 
 MATERIALES_PERMITIDOS = {"glass", "plastic"}

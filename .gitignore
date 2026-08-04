@@ -1,5 +1,10 @@
+# Credenciales y configuración local de EcoSort
+.env
+
+# Artefactos locales de Python
 __pycache__/
 *.pyc
+*.py[cod]
 .ipynb_checkpoints/
 .venv/
 venv/

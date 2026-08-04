@@ -36,7 +36,7 @@ Cuando el objeto **no** es vidrio ni plástico, la laptop lo **avisa por voz**.
 ### 1. Dependencias de Python
 
 ```bash
-pip install onnxruntime opencv-python numpy pyserial "qrcode[pil]"
+pip install onnxruntime opencv-python numpy pyserial "qrcode[pil]" python-dotenv
 ```
 
 > Usa `opencv-python`, **no** `opencv-python-headless`: la versión headless no
@@ -91,11 +91,22 @@ El umbral de confianza y las clases se leen de `model_config.json`.
 La integración se habilita con variables de entorno; la URL debe ser pública y
 HTTPS (por ejemplo, una URL HTTPS temporal de ngrok), nunca `localhost`.
 
-```bash
-export ECOSORT_API_BASE_URL=https://URL-PUBLICA-DE-ECOSORT
-export ECOSORT_DEVICE_API_KEY=clave-secreta-del-dispositivo
-export ECOSORT_QR_ENABLED=true
-export ECOSORT_QR_DISPLAY_SECONDS=120
+En la misma carpeta de `ecosort.py`, copia `.env.example` como `.env` y edita
+la clave. `.env` está protegido por `.gitignore` y no debe subirse a Git.
+
+En Windows:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Luego completa `.env` con:
+
+```text
+ECOSORT_API_BASE_URL=https://ecosort-kyc9iilku-drahciroks-projects.vercel.app
+ECOSORT_DEVICE_API_KEY=la-misma-clave-de-DEVICE_API_KEY-en-Vercel
+ECOSORT_QR_ENABLED=true
+ECOSORT_QR_DISPLAY_SECONDS=120
 ```
 
 Tras una clasificación válida y la confirmación final del Arduino, la laptop
