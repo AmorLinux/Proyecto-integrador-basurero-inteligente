@@ -103,11 +103,17 @@ Copy-Item .env.example .env
 Luego completa `.env` con:
 
 ```text
-ECOSORT_API_BASE_URL=https://ecosort-kyc9iilku-drahciroks-projects.vercel.app
+ECOSORT_API_BASE_URL=https://tu-dominio-publico-de-ecosort.vercel.app
 ECOSORT_DEVICE_API_KEY=la-misma-clave-de-DEVICE_API_KEY-en-Vercel
 ECOSORT_QR_ENABLED=true
 ECOSORT_QR_DISPLAY_SECONDS=120
+ECOSORT_QR_STATUS_INTERVAL_SECONDS=2
 ```
+
+Mientras el QR esta visible, la PC consulta el estado del mismo token cada dos
+segundos. Cuando la web devuelve `claimed`, el QR se cierra sin crear otro
+reciclaje ni interrumpir la logica de Arduino. Si esa consulta falla, el QR se
+mantiene hasta su expiracion normal.
 
 Tras una clasificación válida y la confirmación final del Arduino, la laptop
 hace un único POST a EcoSort y muestra en la misma ventana un QR creado sólo

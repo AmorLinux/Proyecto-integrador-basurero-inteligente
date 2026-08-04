@@ -283,6 +283,16 @@ def solicitar_qr_en_segundo_plano(material, confianza, resultados):
         resultados.put(("error", None, "Error inesperado de EcoSort; QR omitido."))
 
 
+def consultar_estado_qr_en_segundo_plano(token, resultados):
+    """Consulta la confirmacion sin frenar camara, Arduino ni el QR actual."""
+    try:
+        resultados.put(("ok", ecosort.consultar_estado(token)))
+    except EcoSortError as error:
+        resultados.put(("error", str(error)))
+    except Exception:
+        resultados.put(("error", "Error inesperado al consultar el estado del QR."))
+
+
 def mostrar_error_ecosort(cap, mensaje, muestras, muestra_final, comando):
     """Hace visible el fallo brevemente sin detener la captura ni la interfaz."""
     limite = time.time() + 2.0
@@ -373,7 +383,39 @@ def mostrar_qr_o_esperar_error(cap, material, confianza, estado_final, muestras,
         return False
 
     fin_qr = time.time() + segundos
+    resultados_estado = queue.Queue(maxsize=1)
+    consulta_estado_en_curso = False
+    proxima_consulta_estado = time.time()
+    ultimo_error_estado = None
     while time.time() < fin_qr:
+        ahora = time.time()
+        try:
+            resultado_estado, dato_estado = resultados_estado.get_nowait()
+            consulta_estado_en_curso = False
+            if resultado_estado == "ok":
+                ultimo_error_estado = None
+                if dato_estado == "claimed":
+                    print("EcoSort confirmo los puntos; QR cerrado.")
+                    return False
+                if dato_estado == "expired":
+                    print("El QR de EcoSort expiro; QR cerrado.")
+                    return False
+            elif dato_estado != ultimo_error_estado:
+                # Un fallo de consulta no cierra el QR ni altera el flujo fisico.
+                print(f"EcoSort: {dato_estado} Se mantiene el QR actual.")
+                ultimo_error_estado = dato_estado
+        except queue.Empty:
+            pass
+
+        if not consulta_estado_en_curso and ahora >= proxima_consulta_estado:
+            consulta_estado_en_curso = True
+            proxima_consulta_estado = ahora + ecosort.status_interval_seconds
+            threading.Thread(
+                target=consultar_estado_qr_en_segundo_plano,
+                args=(respuesta["token"], resultados_estado),
+                daemon=True,
+            ).start()
+
         frame_live = leer_frame_sin_clasificar(cap)
         if descartar_deteccion_durante_qr():
             if esperar_fin_descarte_durante_qr(cap, muestras, muestra_final, comando):

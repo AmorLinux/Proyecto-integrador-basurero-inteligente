@@ -2,6 +2,7 @@
 
 import json
 import os
+from uuid import UUID
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -54,6 +55,12 @@ class EcoSortClient:
             )
         except ValueError:
             self.display_seconds = 120.0
+        try:
+            self.status_interval_seconds = max(
+                0.5, float(os.environ.get("ECOSORT_QR_STATUS_INTERVAL_SECONDS", "2"))
+            )
+        except ValueError:
+            self.status_interval_seconds = 2.0
 
     def solicitar_reciclaje(self, material, confianza):
         """Hace un único POST y devuelve la respuesta validada de EcoSort."""
@@ -88,7 +95,52 @@ class EcoSortClient:
         if not isinstance(claim_url, str) or not claim_url.startswith("https://"):
             raise EcoSortError("EcoSort devolvió claim_url inválida; QR omitido.")
 
-        return {"claim_url": claim_url, "expires_at": _fecha_iso(cuerpo.get("expires_at"))}
+        token = cuerpo.get("token")
+        if not isinstance(token, str):
+            raise EcoSortError("EcoSort returned an invalid token; QR omitted.")
+        try:
+            UUID(token)
+        except (ValueError, AttributeError) as error:
+            raise EcoSortError("EcoSort returned an invalid token; QR omitted.") from error
+
+        return {
+            "claim_url": claim_url,
+            "token": token,
+            "expires_at": _fecha_iso(cuerpo.get("expires_at")),
+        }
+
+    def consultar_estado(self, token):
+        """Consulta un QR existente; nunca crea puntos ni otro QR."""
+        if not isinstance(token, str):
+            raise EcoSortError("Token de EcoSort invalido.")
+        try:
+            UUID(token)
+        except (ValueError, AttributeError) as error:
+            raise EcoSortError("Token de EcoSort invalido.") from error
+        if not self.base_url or not self.device_key:
+            raise EcoSortError("EcoSort no esta configurado.")
+        if not self.base_url.startswith("https://"):
+            raise EcoSortError("ECOSORT_API_BASE_URL debe usar HTTPS.")
+
+        datos = json.dumps({"token": token}).encode("utf-8")
+        solicitud = Request(
+            f"{self.base_url}/api/recycle/status",
+            data=datos,
+            headers={"Content-Type": "application/json", "x-device-key": self.device_key},
+            method="POST",
+        )
+        try:
+            with urlopen(solicitud, timeout=4) as respuesta:
+                cuerpo = json.loads(respuesta.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            raise EcoSortError("No se pudo consultar el estado del QR.") from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise EcoSortError("EcoSort devolvio un estado de QR invalido.") from error
+
+        estado = cuerpo.get("status") if isinstance(cuerpo, dict) else None
+        if estado not in {"pending", "processing", "claimed", "expired"}:
+            raise EcoSortError("EcoSort devolvio un estado de QR invalido.")
+        return estado
 
     def segundos_visibles(self, expires_at, ahora=None):
         """Aplica el menor límite entre configuración local y expiración remota."""
